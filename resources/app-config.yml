@@ -1,0 +1,11 @@
+telegram:
+  api_id:
+  api_hash: ''
+  phone_number: ''
+  bot:
+    token: ""
+    chatId:
+
+trade:
+  max_open_trades: 0
+  fund_alloc: 2000
