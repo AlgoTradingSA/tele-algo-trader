@@ -177,7 +177,8 @@ def get_trade_candidates(names: [str] = None):
     with lock:
         rows = conn.cursor().execute(
             "SELECT NAME, EXCHANGE, CMP, TGT, SL, OPEN_LEG_TYPE, TRADE_CHANNEL, CREATED_TIMESTAMP "
-            f"FROM TRADE_CANDIDATES {where_clause}", names).fetchall()
+            f"FROM TRADE_CANDIDATES {where_clause}"
+            f"ORDER BY CREATED_TIMESTAMP ASC", names).fetchall()
     tc = [TradeCandidate(*row) for row in rows]
     return tc
 

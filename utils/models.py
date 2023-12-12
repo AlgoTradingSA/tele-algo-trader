@@ -4,6 +4,8 @@ from enum import Enum
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
 def auto_str(cls):
     def __str__(self):
         return '%s(%s)' % (

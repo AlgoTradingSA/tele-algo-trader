@@ -5,6 +5,7 @@ import pathlib
 from math import floor
 from threading import Lock
 from time import sleep
+from zoneinfo import ZoneInfo
 
 import pyotp
 import yaml
@@ -21,6 +22,19 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] (%(threadName)-9s) - %(name)s -  %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
+
+
+def poller(func):
+    async def execution(*args, **kwargs):
+        while True:
+            if (datetime.datetime.now(ZoneInfo(IST_ZONE)).timetz() < MARKET_OPEN_TIME) or \
+                    (datetime.datetime.now(ZoneInfo(IST_ZONE)).timetz() > MARKET_CLOSE_TIME):
+                await asyncio.sleep(60)
+                continue
+            else:
+                await func(*args, **kwargs)
+
+    return execution
 
 
 async def filter_messages(event):
@@ -98,7 +112,7 @@ def order_update_listener(in_message):
             loop.create_task(bot_utils.send_alert(msg))
 
             loop.create_task(gtt_order_handling_async(order_id, in_message['exch'], tsym, in_message['qty'], fill_price,
-                               in_message['fltm']))
+                                                      in_message['fltm']))
 
         elif in_message['status'] in ['REJECTED', 'INVALID_STATUS_TYPE', 'CANCELED']:
             potential_trades_dict[tsym] = None
@@ -253,17 +267,16 @@ async def handle_equity99_recommendations(message: list[str]):
         return None
 
 
+@poller
 async def trade_selector():
-    while True:
-        if (len(potential_trades_dict) + len(open_trades)) >= trade_config['max_open_trades']:
-            logger.info(f"Max trade limit of [{trade_config['max_open_trades']}] reached")
-            await asyncio.sleep(300)
-        elif not candidate_queue.empty():
-            candidate = await candidate_queue.get()
-            # logger.info(candidate)
-            asyncio.create_task(execute_trade(candidate))
-        else:
-            await asyncio.sleep(30)
+    if (len(set(potential_trades_dict.values()) - {None}) + len(open_trades)) >= trade_config['max_open_trades']:
+        logger.info(f"Max trade limit of [{trade_config['max_open_trades']}] reached")
+        await asyncio.sleep(300)
+    elif not candidate_queue.empty():
+        candidate = await candidate_queue.get()
+        # logger.info(candidate)
+        asyncio.create_task(execute_trade(candidate))
+    await asyncio.sleep(30)
 
 
 @retry(Exception, tries=3, delay=5)
@@ -346,33 +359,34 @@ def handle_pending_orders(startup: bool = False):
         db_utils.delete_stock_record(pending_ids)
 
 
+@poller
 async def pending_poller():
-    while True:
-        logger.info("Polling for Pending orders")
-        async with lock:
-            handle_pending_orders()
-        await asyncio.sleep(600)
+    logger.info("Polling for Pending orders")
+    async with lock:
+        handle_pending_orders()
+    await asyncio.sleep(600)
 
 
+@poller
 async def gtt_pending_poller():
-    while True:
-        pending_contracts = await db_utils.get_gtt_pending_orders()
-        logger.info(f"Polling for GTT pending orders, size=[{len(pending_contracts)}]")
-        for contract in pending_contracts:
-            await gtt_order_handling_async(contract.buy_id, contract.exchange, contract.trading_symbol, contract.qty)
-        await asyncio.sleep(60)
+    pending_contracts = await db_utils.get_gtt_pending_orders()
+    logger.info(f"Polling for GTT pending orders, size=[{len(pending_contracts)}]")
+    for contract in pending_contracts:
+        await gtt_order_handling_async(contract.buy_id, contract.exchange, contract.trading_symbol, contract.qty)
+    await asyncio.sleep(60)
 
 
+@poller
 async def candidate_poller():
-    while True:
-        async with lock:
-            candidates_tsym = set(key for (key, value) in potential_trades_dict.items() if key and not value)
-            candidates = db_utils.get_trade_candidates(list(candidates_tsym))
-            logger.info(f"Polling for trade candidates, size=[{len(candidates)}]")
-            for candidate in candidates:
-                # logger.info(candidate)
-                await candidate_queue.put(candidate)
-        await asyncio.sleep(360)
+    async with lock:
+        candidates_tsym = list(key for (key, value) in reversed(potential_trades_dict.items()) if key and not value)
+        logger.info(f"Polled Candidate list: {candidates_tsym}")
+        candidates = db_utils.get_trade_candidates(candidates_tsym)
+        logger.info(f"Polling for trade candidates, size=[{len(candidates)}]")
+        for candidate in candidates:
+            # logger.info(candidate)
+            await candidate_queue.put(candidate)
+    await asyncio.sleep(360)
 
 
 def get_close_leg_type(open_leg_type: str) -> str:
@@ -382,44 +396,45 @@ def get_close_leg_type(open_leg_type: str) -> str:
         return 'B'
 
 
+@poller
 async def open_trade_poller():
-    while True:
-        contracts = await db_utils.get_open_orders()
-        logger.info(f"Polling for OPEN orders, size=[{len(contracts)}]")
+    contracts = await db_utils.get_open_orders()
+    logger.info(f"Polling for OPEN orders, size=[{len(contracts)}]")
 
-        trade_book = broker_service.get_trade_book()
-        order_book = broker_service.get_order_book()
-        trade_bk_dict, order_bk_dict = {}, {}
-        if trade_book:
-            trade_bk_dict = {(trade['tsym'], trade['trantype'], int(trade['flqty'])): trade for trade in
-                             reversed(trade_book)}  # ascending order by time
-        if order_book:
-            order_bk_dict = {(order['tsym'], order['trantype'], int(order['qty'])): order for order in reversed(order_book)}
+    trade_book = broker_service.get_trade_book()
+    order_book = broker_service.get_order_book()
+    trade_bk_dict, order_bk_dict = {}, {}
+    if trade_book:
+        trade_bk_dict = {(trade['tsym'], trade['trantype'], int(trade['qty'])): trade for trade in
+                         reversed(trade_book)}  # ascending order by time
+    if order_book:
+        order_bk_dict = {(order['tsym'], order['trantype'], int(order['qty'])): order for order in
+                         reversed(order_book)}
 
-        for contract in contracts:
-            is_processed = False
-            close_leg = get_close_leg_type(contract.open_leg)
-            if (contract.trading_symbol, close_leg, contract.qty) in trade_bk_dict:
-                trade = trade_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
-                contract.sell_price = trade['flprc']
-                contract.sell_id = trade['norenordno']
-                contract.sell_timestamp = trade['fltm']
-                contract.status = str(ContractStatus.CLOSE)
-                open_trades.remove(contract.trading_symbol)
-                msg = f'Closed order successfully for [{contract.trading_symbol}/{contract.buy_id}]'
+    for contract in contracts:
+        is_processed = False
+        close_leg = get_close_leg_type(contract.open_leg)
+        if (contract.trading_symbol, close_leg, contract.qty) in trade_bk_dict:
+            trade = trade_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
+            contract.sell_price = trade['flprc']
+            contract.sell_id = trade['norenordno']
+            contract.sell_timestamp = trade['fltm']
+            contract.status = str(ContractStatus.CLOSE)
+            open_trades.remove(contract.trading_symbol)
+            msg = f'Closed order successfully for [{contract.trading_symbol}/{contract.buy_id}]'
+            db_utils.delete_stock_record(contract.buy_id)
+            await db_utils.insert_stock_record(contract)
+            await bot_utils.send_alert(msg)
+            is_processed = True
+        if not is_processed and (contract.trading_symbol, close_leg, contract.qty) in order_bk_dict:
+            order = order_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
+            if order['status'] in ['REJECTED', 'INVALID_STATUS_TYPE', 'CANCELED']:
+                msg = f"[CLOSE Order [{order['tsym']}] failed: [{order['status']}] [{order['rejreason']}]"
+                contract.status = str(ContractStatus.GTT_PENDING)
                 db_utils.delete_stock_record(contract.buy_id)
                 await db_utils.insert_stock_record(contract)
-                await bot_utils.send_alert(msg)
-                is_processed = True
-            if not is_processed and (contract.trading_symbol, close_leg, contract.qty) in order_bk_dict:
-                order = order_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
-                if order['status'] in ['REJECTED', 'INVALID_STATUS_TYPE', 'CANCELED']:
-                    msg = f"[CLOSE Order [{order['tsym']}] failed: [{order['status']}] [{order['rejreason']}]"
-                    contract.status = str(ContractStatus.GTT_PENDING)
-                    db_utils.delete_stock_record(contract.buy_id)
-                    await db_utils.insert_stock_record(contract)
-                    await bot_utils.send_alert(msg, logging.WARN)
-        await asyncio.sleep(240)
+                await bot_utils.send_alert(msg, logging.WARN)
+    await asyncio.sleep(240)
 
 
 async def startup_activity():
@@ -427,9 +442,9 @@ async def startup_activity():
     db_utils.purge_trade_candidates()
     tc = db_utils.get_trade_candidates()
     potential_trades_dict.update({t.trading_symbol: None for t in tc})
-
     pending_orders = db_utils.get_pending_orders()
     potential_trades_dict.update({p.trading_symbol: p.buy_id for p in pending_orders})
+    logger.info(f"Initial Candidate list: {potential_trades_dict}")
     handle_pending_orders(True)
 
     open_trades.update([tc.trading_symbol for tc in db_utils.get_open_orders_internal()])
@@ -452,6 +467,10 @@ if __name__ == '__main__':
 
     # message_selectors = ['Special Situation', 'conviction' 'PSU STOCK', 'btst']
     message_selectors = ['cmp', '@', 'buy', 'exit', 'book profit']  # 'test level'
+
+    IST_ZONE = 'Asia/Calcutta'
+    MARKET_OPEN_TIME = datetime.time(9, 15, 00, 00, ZoneInfo(IST_ZONE))
+    MARKET_CLOSE_TIME = datetime.time(15, 30, 00, 00, ZoneInfo(IST_ZONE))
 
     client = TelegramClient('anon',
                             tele_config["api_id"],

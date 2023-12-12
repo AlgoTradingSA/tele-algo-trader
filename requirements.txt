@@ -7,3 +7,4 @@ pyotp~=2.9.0
 Telethon==1.32.1
 retry~=0.9.2
 SQLAlchemy~=2.0.23
+tzdata
