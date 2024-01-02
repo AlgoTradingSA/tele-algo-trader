@@ -1,7 +1,7 @@
 
-00 9 * * 1-5 python3 /home/ubuntu/latest/algo-trader/main.py > /home/ubuntu/logs/algo-trader.log 2>&1
+00 8 * * 1-5 cd /home/ubuntu/latest/algo-trader && python3 /home/ubuntu/latest/algo-trader/main.py > /home/ubuntu/logs/algo-trader.log 2>&1
 
-40 15 * * 1-5 sudo pkill python3
+45 23 * * 1-5 sudo pkill python3
 
 0 0 * * sudo reboot
 

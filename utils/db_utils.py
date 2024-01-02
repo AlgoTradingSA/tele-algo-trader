@@ -4,7 +4,7 @@ import sqlite3
 from sqlite3 import Connection
 from threading import Lock
 
-from utils.models import TradeCandidate, TradeContract, ContractStatus
+from utils.models import TradeCandidate, TradeContract, ContractStatus, TradeChannels
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ def purge_trade_candidates():
     with lock:
         rows = conn.cursor().execute("DELETE FROM TRADE_CANDIDATES "
                                      "WHERE "
-                                     "datetime(CREATED_TIMESTAMP) <= datetime('now', '-5 Days')")
+                                     "datetime(CREATED_TIMESTAMP) <= datetime('now', '-1 Days')")
         conn.commit()
         logger.info(f"Purged Trading candidates : {rows.rowcount}")
 
@@ -206,3 +206,11 @@ def get_pending_orders() -> [TradeContract]:
 
     contracts = [TradeContract(*row) for row in rows]
     return contracts
+
+
+def get_trade_count(trade_channel: TradeChannels) -> int:
+    global conn
+    sql = f"SELECT COUNT(*) FROM STOCK_RECORD WHERE STATUS != ? AND TRADE_CHANNEL IN (?, ?)"
+    with lock:
+        rows = conn.cursor().execute(sql, [str(ContractStatus.CLOSE), trade_channel.name, str(trade_channel)]).fetchone()
+    return int(rows[0])

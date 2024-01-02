@@ -28,6 +28,16 @@ class ShoonyaBrokerService(NorenApi):
     # "place_order_params_leg2":{"tsym":"RELIANCE-EQ", "exch":"NSE", "trantype":"S",
     # "prctyp":"MKT","prd":"C", "ret":"DAY","actid":"FA100908","uid":"FA100908",
     # "ordersource":"WEB","qty":"1", "prc":"0"}}&jKey=40f4195d931f9b6d5a3bf1dfd282ecce1544f0dc6440e4edc69822a46f071c87
+
+    # jData={"uid":"FA100908","ai_t":"LMT_BOS_O","remarks":"tgt","validity":"GTT",
+    # "tsym":"NIFTY04JAN24C22000","exch":"NFO","oivariable":[{"d":"50","var_name":"x"},
+    # {"d":"0.1", "var_name":"y"}],"place_order_params":{"tsym":"NIFTY04JAN24C22000",
+    # "exch":"NFO","trantype":"S","prctyp":"MKT","prd":"I",
+    # "ret":"DAY","actid":"FA100908","uid":"FA100908", "ordersource":"WEB","qty":"50", "prc":"0"}
+    # ,"place_order_params_leg2":{"tsym":"NIFTY04JAN24C22000", "exch":"NFO",
+    # "trantype":"S", "prctyp":"MKT","prd":"I", "ret":"DAY","actid":"FA100908",
+    # "uid":"FA100908", "ordersource":"WEB","qty":"50", "prc":"0"}}
+    # &jKey=a11ead44581062d36feec63582c4e7a3327d3bd86932100cce09192afd204399
     def place_oco_order(self, buy_or_sell, exchange, trading_symbol,
                         quantity, tgt_price, sl_price, product_type='C', alerttype='LMT_BOS_O',
                         price_type='MKT', retention='DAY'):
@@ -127,6 +137,31 @@ class ShoonyaBrokerService(NorenApi):
             return None
 
         return res_dict
+
+    def get_available_cash(self):
+        limits = self.get_limits()
+        cash_available = -1
+        cash, used = 0, 0
+
+        if limits and limits['stat'] == 'Ok':
+            if 'cash' in limits:
+                cash = limits['cash']
+            if 'marginused' in limits:
+                used = limits['marginused']
+            logger.info(limits)
+            cash_available = round(float(cash) - float(used), 2)
+        return cash_available
+
+    def get_pnl(self) -> (float, float, float):
+        ret = self.get_positions()
+        mtm = 0
+        pnl = 0
+        if ret:
+            for i in ret:
+                mtm += float(i['urmtom'])
+                pnl += float(i['rpnl'])
+        day_m2m = mtm + pnl
+        return pnl, mtm, day_m2m
 
     def event_handler_order_update(self, message):
         logger.info("order event: " + str(message))

@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 import pathlib
+from asyncio import AbstractEventLoop
 from math import floor
 from threading import Lock
 from time import sleep
@@ -11,6 +12,7 @@ import pyotp
 import yaml
 from retry import retry
 from telethon import TelegramClient, events, client
+from telethon.tl.types import PeerChannel
 
 from services.shoonya_broker_service import ShoonyaBrokerService
 from utils import db_utils, bot_utils
@@ -33,13 +35,14 @@ def poller(func):
                 continue
             else:
                 await func(*args, **kwargs)
+                await asyncio.sleep(30)
 
     return execution
 
 
 async def filter_messages(event):
     message = event.raw_text.lower()
-    if event.from_id and event.from_id.user_id == 6037318029:
+    if event.from_id and not isinstance(event.from_id, PeerChannel) and event.from_id.user_id == 6037318029:
         return False
     for word in message_selectors:
         if word in message:
@@ -62,23 +65,26 @@ async def telegram_login():
         logger.info(f'Received message: {message}')
 
         sender = await event.get_sender()
-        tc: TradeCandidate = None
+        tc_list: [TradeCandidate] = []
         if TradeChannels.equity99.name == sender.username:
-            tc = await handle_equity99_recommendations(message.split("\n"))
+            tc_list.append(await handle_equity99_recommendations(message.split("\n")))
         elif TradeChannels.AngelOneAdvisory.name == sender.username:
             message = message.lower()
             if ' ce ' not in message and ' pe ' not in message:
                 if 'buy' in message:
-                    tc = await handle_angel_recommendations(message)
+                    tc_list.append(await handle_angel_recommendations(message))
                     # 'exit', 'book profit'
                 elif 'exit' in message or 'book profit' in message:
                     await handle_angel_exits(message)
+        elif ":" in message:
+            tc_list.extend(await handle_custom_recommendations(message.split("\n")))
 
-        async with lock:
-            if tc and not (tc.trading_symbol in potential_trades_dict or tc.trading_symbol in open_trades):
-                potential_trades_dict[tc.trading_symbol] = None
-                await candidate_queue.put(tc)
-                await db_utils.insert_trade_candidate(tc)
+        for tc in tc_list:
+            async with lock:
+                if tc and not (tc.trading_symbol in potential_trades_dict or tc.trading_symbol in open_trades):
+                    potential_trades_dict[tc.trading_symbol] = None
+                    await candidate_queue.put(tc)
+                    await db_utils.insert_trade_candidate(tc)
 
 
 async def broker_login():
@@ -91,6 +97,7 @@ async def broker_login():
             logger.info(f"Broker login successful, Session id: {ret['susertoken']}")
             broker_service.connect_websocket(order_update_listener)
             await bot_utils.send_alert("Successfully logged into broker account")
+            logger.info(broker_service.get_pnl())
 
         else:
             msg = "Unable to start broker session"
@@ -165,10 +172,10 @@ def get_first_number(msg: list[str], default=None):
 
 
 def compute_tgt(cmp: float, tgt: float):
-    default_tgt = round(1.2 * cmp, 2)
+    default_tgt = round(1.1 * cmp, 2)
     if not tgt:
         return default_tgt
-    elif tgt > 1.5 * cmp:
+    elif tgt > 1.15 * cmp:
         return default_tgt
     elif tgt <= cmp:
         return default_tgt
@@ -261,27 +268,53 @@ async def handle_equity99_recommendations(message: list[str]):
     logger.info(f"[{tsym}]:{exch} {cmp}, {tgt}, {sl}")
 
     if cmp and sl and tsym and exch and cmp != -1 and sl != -1:
-        return TradeCandidate(tsym, exch, cmp, compute_tgt(cmp, tgt), compute_sl(cmp, sl), 'B', TradeChannels.equity99)
+        new_tgt = cmp + 0.7 * (tgt - cmp)
+        return TradeCandidate(tsym, exch, cmp, compute_tgt(cmp, new_tgt), compute_sl(cmp, sl), 'B',
+                              TradeChannels.equity99)
     else:
         logger.info(f"cannot create trade candidate from message:[{message}]")
         return None
 
 
-@poller
-async def trade_selector():
-    if (len(set(potential_trades_dict.values()) - {None}) + len(open_trades)) >= trade_config['max_open_trades']:
-        logger.info(f"Max trade limit of [{trade_config['max_open_trades']}] reached")
-        await asyncio.sleep(300)
-    elif not candidate_queue.empty():
-        candidate = await candidate_queue.get()
-        # logger.info(candidate)
-        asyncio.create_task(execute_trade(candidate))
-    await asyncio.sleep(30)
+async def handle_custom_recommendations(in_msg) -> [TradeCandidate]:
+    tc_list = []
+    for msg in in_msg:
+        msg = msg.split(',')
+        if len(msg) > 1:
+            tsym, exch = await get_tsym_and_exch(msg[0].split(':')[-1].strip())
+            cmp = float(msg[1].split(':')[-1].strip())
+            if cmp and tsym and exch:
+                sl = round(0.95 * cmp, 2)
+                tgt = round(1.1 * cmp, 2)
+                logger.info(f"[{tsym}]:{exch} {cmp}, {tgt}, {sl}")
+                tc_list.append(TradeCandidate(tsym, exch, cmp, compute_tgt(cmp, tgt), compute_sl(cmp, sl), 'B',
+                                              TradeChannels.CustomChannel))
+            else:
+                logger.info(f"cannot create trade candidate from message:[{in_msg}]")
+    return tc_list
 
+
+async def trade_selector():
+    existing_trade_count = len(set(potential_trades_dict.values()) - {None}) + len(open_trades)
+    if existing_trade_count >= trade_config['max_open_trades']:
+        logger.info(f"Max trade limit of [{trade_config['max_open_trades']}] reached")
+    elif not candidate_queue.empty():
+        candidate: TradeCandidate = await candidate_queue.get()
+        # logger.info(candidate)
+        trade_count = db_utils.get_trade_count(TradeChannels[candidate.trade_channel])
+        max_count = trade_config[candidate.trade_channel]['max_open_trades']
+        if trade_count < max_count:
+            asyncio.create_task(execute_trade(candidate))
+        else:
+            logger.info(f"Max trade limit of [{max_count}] reached for [{candidate.trade_channel}]")
 
 @retry(Exception, tries=3, delay=5)
 async def execute_trade(tc: TradeCandidate):
-    quantity = floor(trade_config['fund_alloc'] / tc.cmp)
+    quantity = floor(trade_config[tc.trade_channel]['fund_alloc'] / tc.cmp)
+    cash = broker_service.get_available_cash()
+    if cash < (quantity * tc.cmp):
+        logger.warning(f"Balance of {[cash]} is insufficient to trade")
+        return
     if quantity < 1:
         logger.warning(f"Unable to place trade for [{tc.trading_symbol}] with quantity: [{quantity}]")
         db_utils.delete_trade_candidate(tc.trading_symbol)
@@ -289,35 +322,36 @@ async def execute_trade(tc: TradeCandidate):
         return
     order_type = tc.open_leg
     msg = f"Placing [BUY] Order for symbol {tc.trading_symbol}, CMP: [{tc.cmp}], target: {tc.tgt}, " \
-          f"quantity: {quantity}, stop_loss: {tc.sl}"
+          f"quantity: {quantity}, stop_loss: {tc.sl}, channel: {tc.trade_channel}"
     await bot_utils.send_alert(msg)
-    res = broker_service.place_order(buy_or_sell=order_type, product_type='C', exchange=tc.exchange,
-                                     tradingsymbol=tc.trading_symbol, quantity=quantity, discloseqty=0,
-                                     price_type='LMT', price=tc.cmp, retention='DAY',
-                                     remarks=f'Buy order for {tc.trading_symbol}')
 
-    if res is None:
-        raise Exception(f"Failed to place order for symbol={tc.trading_symbol}")
-    else:
-        # print(res)
-        await asyncio.sleep(0.1)
-        order_id = res['norenordno']
-        o_book = broker_service.get_order_book()
+    async with lock:
+        res = broker_service.place_order(buy_or_sell=order_type, product_type='C', exchange=tc.exchange,
+                                         tradingsymbol=tc.trading_symbol, quantity=quantity, discloseqty=0,
+                                         price_type='LMT', price=tc.cmp, retention='DAY',
+                                         remarks=f'Buy order for {tc.trading_symbol}')
 
-        for order in o_book:
-            if order_id == order['norenordno']:
-                if order['status'] == 'REJECTED':
-                    msg = f"Order for [{tc.trading_symbol}] rejected by broker: {order['rejreason']}"
-                    await bot_utils.send_alert(msg, logging.WARN)
-                else:
-                    async with lock:
+        if res is None:
+            raise Exception(f"Failed to place order for symbol={tc.trading_symbol}")
+        else:
+            # print(res)
+            await asyncio.sleep(0.1)
+            order_id = res['norenordno']
+            o_book = broker_service.get_order_book()
+
+            for order in o_book:
+                if order_id == order['norenordno']:
+                    if order['status'] == 'REJECTED':
+                        msg = f"Order for [{tc.trading_symbol}] rejected by broker: {order['rejreason']}"
+                        await bot_utils.send_alert(msg, logging.WARN)
+                    else:
                         potential_trades_dict[tc.trading_symbol] = order_id
-                    contract = TradeContract.from_trade_candidate(tc, ContractStatus.PENDING, quantity,
-                                                                  order_id)
-                    await db_utils.insert_stock_record(contract)
-                    logger.info(f"Successfully placed order: {res}")
-                return
-        logger.warning(f"Order {order_id} not found in order book")
+                        contract = TradeContract.from_trade_candidate(tc, ContractStatus.PENDING, quantity,
+                                                                      order_id)
+                        await db_utils.insert_stock_record(contract)
+                        logger.info(f"Successfully placed order: {res}")
+                    return
+            logger.warning(f"Order {order_id} not found in order book")
 
 
 # TESTING METHOD
@@ -359,34 +393,29 @@ def handle_pending_orders(startup: bool = False):
         db_utils.delete_stock_record(pending_ids)
 
 
-@poller
 async def pending_poller():
     logger.info("Polling for Pending orders")
     async with lock:
         handle_pending_orders()
-    await asyncio.sleep(600)
 
 
-@poller
 async def gtt_pending_poller():
     pending_contracts = await db_utils.get_gtt_pending_orders()
     logger.info(f"Polling for GTT pending orders, size=[{len(pending_contracts)}]")
     for contract in pending_contracts:
         await gtt_order_handling_async(contract.buy_id, contract.exchange, contract.trading_symbol, contract.qty)
-    await asyncio.sleep(60)
 
 
-@poller
 async def candidate_poller():
     async with lock:
         candidates_tsym = list(key for (key, value) in reversed(potential_trades_dict.items()) if key and not value)
         logger.info(f"Polled Candidate list: {candidates_tsym}")
-        candidates = db_utils.get_trade_candidates(candidates_tsym)
-        logger.info(f"Polling for trade candidates, size=[{len(candidates)}]")
-        for candidate in candidates:
-            # logger.info(candidate)
-            await candidate_queue.put(candidate)
-    await asyncio.sleep(360)
+        if candidates_tsym:
+            candidates = db_utils.get_trade_candidates(candidates_tsym)
+            logger.info(f"Polling for trade candidates, size=[{len(candidates)}]")
+            for candidate in candidates:
+                # logger.info(candidate)
+                await candidate_queue.put(candidate)
 
 
 def get_close_leg_type(open_leg_type: str) -> str:
@@ -396,7 +425,6 @@ def get_close_leg_type(open_leg_type: str) -> str:
         return 'B'
 
 
-@poller
 async def open_trade_poller():
     contracts = await db_utils.get_open_orders()
     logger.info(f"Polling for OPEN orders, size=[{len(contracts)}]")
@@ -434,7 +462,6 @@ async def open_trade_poller():
                 db_utils.delete_stock_record(contract.buy_id)
                 await db_utils.insert_stock_record(contract)
                 await bot_utils.send_alert(msg, logging.WARN)
-    await asyncio.sleep(240)
 
 
 async def startup_activity():
@@ -451,6 +478,15 @@ async def startup_activity():
     logger.info(f"Open Trades: {open_trades}")
 
 
+@poller
+async def polling_activity():
+    await pending_poller()
+    await open_trade_poller()
+    await gtt_pending_poller()
+    await candidate_poller()
+    await trade_selector()
+
+
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     initialize_db()
@@ -464,9 +500,10 @@ if __name__ == '__main__':
         app_config = yaml.load(f, Loader=yaml.FullLoader)
         tele_config = app_config['telegram']
         trade_config = app_config['trade']
+        trade_config['max_open_trades'] = sum([val['max_open_trades'] for (_, val) in trade_config.items()])
 
     # message_selectors = ['Special Situation', 'conviction' 'PSU STOCK', 'btst']
-    message_selectors = ['cmp', '@', 'buy', 'exit', 'book profit']  # 'test level'
+    message_selectors = ['cmp', '@', 'buy', 'exit', 'book profit', 'closing price']  # 'test level'
 
     IST_ZONE = 'Asia/Calcutta'
     MARKET_OPEN_TIME = datetime.time(9, 15, 00, 00, ZoneInfo(IST_ZONE))
@@ -477,7 +514,7 @@ if __name__ == '__main__':
                             tele_config["api_hash"])
 
     with client:
-        loop = client.loop
+        loop: AbstractEventLoop = client.loop
         broker_service = ShoonyaBrokerService()
 
         loop.create_task(initialize_bot(tele_config))
@@ -485,10 +522,5 @@ if __name__ == '__main__':
         loop.create_task(telegram_login())
 
         asyncio.gather(startup_activity())
-
-        loop.create_task(pending_poller())
-        loop.create_task(gtt_pending_poller())
-        loop.create_task(candidate_poller())
-        loop.create_task(open_trade_poller())
-        loop.create_task(trade_selector())
+        loop.create_task(polling_activity())
         client.run_until_disconnected()

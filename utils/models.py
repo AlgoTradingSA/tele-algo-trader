@@ -34,6 +34,7 @@ class ContractStatus(Enum):
 class TradeChannels(Enum):
     equity99 = 1
     AngelOneAdvisory = 2
+    CustomChannel = 3
 
 
 @auto_str
@@ -47,7 +48,14 @@ class TradeCandidate:
         self.tgt = tgt
         self.sl = sl
         self.open_leg = open_leg
-        self.trade_channel = str(trade_channel)
+
+        if isinstance(trade_channel, str):
+            if "." in trade_channel:
+                self.trade_channel = str(trade_channel).split(".")[1]
+            else:
+                self.trade_channel = trade_channel
+        else:
+            self.trade_channel = trade_channel.name
         if created_timestamp:
             self.created_timestamp = created_timestamp
         else:
@@ -102,5 +110,4 @@ class SetQueue(Queue):
         self._queue.add(item)
 
     def _get(self):
-        logger.info(self._queue)
         return self._queue.pop()
