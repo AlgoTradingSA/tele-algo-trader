@@ -7,5 +7,12 @@ telegram:
     chatId:
 
 trade:
-  max_open_trades: 0
-  fund_alloc: 2000
+  equity99:
+    max_open_trades: 2
+    fund_alloc: 2000
+  AngelOneAdvisory:
+    max_open_trades: 2
+    fund_alloc: 2000
+  CustomChannel:
+    max_open_trades: 2
+    fund_alloc: 1000
