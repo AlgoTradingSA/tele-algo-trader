@@ -1,6 +1,7 @@
 import json
 import logging
 import urllib
+from datetime import datetime
 from functools import partial
 from threading import Thread
 
@@ -12,9 +13,12 @@ logger = logging.getLogger(__name__)
 
 class ShoonyaBrokerService(NorenApi):
     def __init__(self):
+        self.subscription_set = set()
         self.host = 'https://api.shoonya.com/NorenWClientTP/'
         self.routes = {'placegttorder': 'PlaceGTTOrder', 'placeocoorder': 'PlaceOCOOrder',
                        'cancelgttorder': 'CancelGTTOrder'}
+        self.REFDATA_MAP: dict = dict()
+
         NorenApi.__init__(self, host=self.host,
                           websocket='wss://api.shoonya.com/NorenWSTP/'
                           # ,eodhost='https://api.shoonya.com/chartApi/getdata/'
@@ -28,16 +32,6 @@ class ShoonyaBrokerService(NorenApi):
     # "place_order_params_leg2":{"tsym":"RELIANCE-EQ", "exch":"NSE", "trantype":"S",
     # "prctyp":"MKT","prd":"C", "ret":"DAY","actid":"FA100908","uid":"FA100908",
     # "ordersource":"WEB","qty":"1", "prc":"0"}}&jKey=40f4195d931f9b6d5a3bf1dfd282ecce1544f0dc6440e4edc69822a46f071c87
-
-    # jData={"uid":"FA100908","ai_t":"LMT_BOS_O","remarks":"tgt","validity":"GTT",
-    # "tsym":"NIFTY04JAN24C22000","exch":"NFO","oivariable":[{"d":"50","var_name":"x"},
-    # {"d":"0.1", "var_name":"y"}],"place_order_params":{"tsym":"NIFTY04JAN24C22000",
-    # "exch":"NFO","trantype":"S","prctyp":"MKT","prd":"I",
-    # "ret":"DAY","actid":"FA100908","uid":"FA100908", "ordersource":"WEB","qty":"50", "prc":"0"}
-    # ,"place_order_params_leg2":{"tsym":"NIFTY04JAN24C22000", "exch":"NFO",
-    # "trantype":"S", "prctyp":"MKT","prd":"I", "ret":"DAY","actid":"FA100908",
-    # "uid":"FA100908", "ordersource":"WEB","qty":"50", "prc":"0"}}
-    # &jKey=a11ead44581062d36feec63582c4e7a3327d3bd86932100cce09192afd204399
     def place_oco_order(self, buy_or_sell, exchange, trading_symbol,
                         quantity, tgt_price, sl_price, product_type='C', alerttype='LMT_BOS_O',
                         price_type='MKT', retention='DAY'):
@@ -172,8 +166,35 @@ class ShoonyaBrokerService(NorenApi):
             pass
 
     def event_handler_quote_update(self, in_message):
-        # TODO: add ticker handling functionality
-        pass
+        # e   Exchange
+        # tk  Token
+        # lp  LTP
+        # pc  Percentage change
+        # v   volume
+        # o   Open price
+        # h   High price
+        # l   Low price
+        # c   Close price
+        # ap  Average trade price
+
+        fields = ['ts', 'lp', 'h', 'l', 'ltp', 'key', 'Type', 'e', 'ts']
+        key = in_message['e'] + '|' + in_message['tk']
+        message = {field: in_message[field] for field in set(fields) & set(in_message.keys())}
+        message['ft'] = None
+        if 'ft' in in_message.keys():
+            feed_time = int(in_message['ft'])
+            message['ft'] = str(datetime.fromtimestamp(feed_time))
+
+        # message['Type'] = message['ts'][12]
+        # TODO
+        logger.debug(f"quote event: {in_message}")
+        # with self.lock:
+        if key in self.REFDATA_MAP:
+            symbol_info = self.REFDATA_MAP[key]
+            symbol_info.update(message)
+            self.REFDATA_MAP[key] = symbol_info
+        else:
+            self.REFDATA_MAP[key] = message
 
     def open_callback(self, subscribe_text, feed_type='t'):
 
@@ -191,6 +212,15 @@ class ShoonyaBrokerService(NorenApi):
     def unsubscribe_ws(self, unsubscribe_text, feed_type='t'):
         logger.info(f"Unsubscribing instrument: {unsubscribe_text}")
         self.unsubscribe(unsubscribe_text, feed_type)
+
+    # remove unnecessary subscriptions to improve websocket performance
+    # resubscribing is required as of now but will be removed in the future
+    def manage_subscription(self, subscribe_list):
+        if subscribe_list is not None:
+            self.subscription_set.update(subscribe_list)
+            self.subscribe_ws(list(self.subscription_set))
+        else:
+            logger.warning("Subscribe is missing. Skipping subscription management")
 
     def event_handler_socket_closed(self):
         """ Callback function which gets invoked as and when the socket is closed """

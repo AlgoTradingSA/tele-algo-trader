@@ -161,3 +161,4 @@ cython_debug/
 /anon.session
 /bot.session
 /database.db
+/bot.session-journal

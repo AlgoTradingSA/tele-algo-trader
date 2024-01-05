@@ -1,43 +1,27 @@
 import asyncio
-import datetime
 import logging
 import pathlib
 from asyncio import AbstractEventLoop
-from math import floor
-from threading import Lock
-from time import sleep
-from zoneinfo import ZoneInfo
 
 import pyotp
 import yaml
-from retry import retry
 from telethon import TelegramClient, events, client
 from telethon.tl.types import PeerChannel
 
+from services.derivative_trade_service import DerivativeTradeService
+from services.equity_trade_service import EquityTradeService
 from services.shoonya_broker_service import ShoonyaBrokerService
-from utils import db_utils, bot_utils
+from services.trade_service import get_first_number, compute_tgt, compute_sl, compute_long_derivative_exits
+from utils import bot_utils, db_utils
 from utils.bot_utils import initialize_bot
 from utils.db_utils import initialize_db
-from utils.models import TradeCandidate, TradeContract, ContractStatus, SetQueue, TradeChannels
+from utils.helpers import poller
+from utils.models import TradeCandidate, TradeChannels, ContractStatus
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] (%(threadName)-9s) - %(name)s -  %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
-
-
-def poller(func):
-    async def execution(*args, **kwargs):
-        while True:
-            if (datetime.datetime.now(ZoneInfo(IST_ZONE)).timetz() < MARKET_OPEN_TIME) or \
-                    (datetime.datetime.now(ZoneInfo(IST_ZONE)).timetz() > MARKET_CLOSE_TIME):
-                await asyncio.sleep(60)
-                continue
-            else:
-                await func(*args, **kwargs)
-                await asyncio.sleep(30)
-
-    return execution
 
 
 async def filter_messages(event):
@@ -70,21 +54,18 @@ async def telegram_login():
             tc_list.append(await handle_equity99_recommendations(message.split("\n")))
         elif TradeChannels.AngelOneAdvisory.name == sender.username:
             message = message.lower()
-            if ' ce ' not in message and ' pe ' not in message:
-                if 'buy' in message:
-                    tc_list.append(await handle_angel_recommendations(message))
-                    # 'exit', 'book profit'
-                elif 'exit' in message or 'book profit' in message:
-                    await handle_angel_exits(message)
+            if 'buy' in message:
+                tc = await handle_angel_recommendations(message)
+                if isinstance(tc, TradeCandidate):
+                    tc_list.append(tc)
+                # 'exit', 'book profit'
+            elif 'exit' in message or 'book profit' in message:
+                await handle_angel_exits(message)
+
         elif ":" in message:
             tc_list.extend(await handle_custom_recommendations(message.split("\n")))
 
-        for tc in tc_list:
-            async with lock:
-                if tc and not (tc.trading_symbol in potential_trades_dict or tc.trading_symbol in open_trades):
-                    potential_trades_dict[tc.trading_symbol] = None
-                    await candidate_queue.put(tc)
-                    await db_utils.insert_trade_candidate(tc)
+        await equity_trade_service.create_trade_candidate(tc_list)
 
 
 async def broker_login():
@@ -104,114 +85,46 @@ async def broker_login():
             await bot_utils.send_alert(msg, logging.WARN)
 
 
-def order_update_listener(in_message):
-    logger.info(f'Received broker update: {in_message}')
-    order_id = in_message['norenordno']
-    tsym = in_message['tsym']
-    sleep(1)
-    # with thread_lock:
-    if order_id and order_id in potential_trades_dict.values():  # check only if buy order was placed
-        tran_type = in_message['trantype']
-        if in_message['status'] == 'COMPLETE':
-            fill_price = in_message['flprc']
-
-            msg = f"[{tran_type}] Order executed successfully for symbol {tsym}, fill price: [{fill_price}], qty: [{in_message['qty']}]"
-            loop.create_task(bot_utils.send_alert(msg))
-
-            loop.create_task(gtt_order_handling_async(order_id, in_message['exch'], tsym, in_message['qty'], fill_price,
-                                                      in_message['fltm']))
-
-        elif in_message['status'] in ['REJECTED', 'INVALID_STATUS_TYPE', 'CANCELED']:
-            potential_trades_dict[tsym] = None
-            db_utils.delete_stock_record(order_id)
-            msg = f"[{tran_type}] Order [{order_id}/{tsym}] failed: [{in_message['rejreason']}]"
-            loop.create_task(bot_utils.send_alert(msg, logging.WARN))
-
-
-async def gtt_order_handling_async(order_id, exchange, tsym, qty, fill_prc=None, fill_time=None):
-    async with lock:
-        gtt_order_handling(order_id, exchange, tsym, qty, fill_prc, fill_time)
-
-
-def gtt_order_handling(order_id, exchange, tsym, qty, fill_prc=None, fill_time=None):
-    sl, tgt = db_utils.get_sr_prices(order_id)
-    is_ggt_placed, gtt_resp = place_cover_order('S', exchange, tsym, qty, tgt, sl)
-    al_id = None
-    if is_ggt_placed:
-        msg = f'Successfully placed GTT order for [{tsym}/{order_id}]: {gtt_resp}'
-        loop.create_task(bot_utils.send_alert(msg))
-        status = ContractStatus.OPEN
-        al_id = gtt_resp['al_id']
-        open_trades.add(tsym)
-        potential_trades_dict.pop(tsym, None)
+def order_update_listener(message):
+    exchange = message['exch']
+    if exchange == 'NFO':
+        derivative_trade_service.order_update_listener(message)
     else:
-        msg = f'Failed to place GTT order for [{tsym}/{order_id}]: {gtt_resp}'
-        loop.create_task(bot_utils.send_alert(msg, logging.WARN))
-        status = ContractStatus.GTT_PENDING
-    db_utils.update_gtt_status(status, order_id, al_id, fill_prc, fill_time)
-    db_utils.delete_trade_candidate(tsym)
+        equity_trade_service.order_update_listener(message)
 
 
-def place_cover_order(buy_or_sell, exchange, trading_symbol, quantity, tgt, sl):
-    resp = broker_service.place_oco_order(buy_or_sell, exchange, trading_symbol, quantity, tgt, sl)
-    if resp and resp['stat'].lower() == 'oi created':
-        return True, resp
-    return False, resp
-
-
-def get_first_number(msg: list[str], default=None):
-    result = default
-    for m in msg:
-        m = m.strip()
-        try:
-            result = float(m)
-            break
-        except:
-            pass
-    return result
-
-
-def compute_tgt(cmp: float, tgt: float):
-    default_tgt = round(1.1 * cmp, 2)
-    if not tgt:
-        return default_tgt
-    elif tgt > 1.15 * cmp:
-        return default_tgt
-    elif tgt <= cmp:
-        return default_tgt
-    else:
-        return tgt
-
-
-def compute_sl(cmp: float, sl: float):
-    default_sl = round(0.8 * cmp, 2)
-    if not sl:
-        return default_sl
-    elif sl < 0.6 * cmp:
-        return default_sl
-    elif sl >= cmp:
-        return default_sl
-    else:
-        return sl
-
-
-async def get_tsym_and_exch(name: str) -> (str, str):
-    if name:
-        json = broker_service.searchscrip('NSE', name)
-        if json:
-            logger.debug(json['values'])
-            return json['values'][0]['tsym'], json['values'][0]['exch']
-    return None, None
-
-
+# TODO add handling for short orders
 async def handle_angel_exits(message):
-    # TODO alert
-    exit_selector = 'at'
-    if '@' in message:
-        exit_selector = '@'
+    message = message.split('\n')
+    ticker = ''
+    tick_splitter = ''
+    pos = 0
+    for msg in message:
+        if '@' in msg:
+            price_splitter = '@'
+        else:
+            price_splitter = 'at'
 
-    mlist = message.split(exit_selector)
-    # TODO complete later
+        if 'book profit' in msg:
+            tick_splitter = 'in'
+            pos = 1
+        elif 'exit from' in msg:
+            tick_splitter = 'exit from'
+        elif 'exit' in msg:
+            tick_splitter = 'exit'
+
+        if tick_splitter:
+            ticker = msg.split(tick_splitter)[pos].split(price_splitter)[0].strip()
+            break
+
+    if 'pe' in ticker or 'ce' in ticker:
+        tsym, exch = await equity_trade_service.get_tsym_and_exch(ticker.upper(), 'NFO')
+        contracts = db_utils.get_active_contracts_by_symbol(tsym, 'B', exch)
+        if contracts:
+            for ctx in contracts:
+                if ctx.status == str(ContractStatus.OPEN):
+                    derivative_trade_service.immediate_long_exit_set.add(ctx.buy_id)
+                    await bot_utils.send_alert(f"Exit message received for {tsym}/{ctx.buy_id}")
 
 
 async def handle_angel_recommendations(message: str):
@@ -221,7 +134,11 @@ async def handle_angel_recommendations(message: str):
     for msg in message:
         if 'buy' in msg:
             msg_split = msg.split(' ')
-            tsym, exch = await get_tsym_and_exch(msg_split[2])
+            if ' ce ' in msg or ' pe ' in msg:
+                tick = msg.split('buy')[-1].split('1 lot')[0].strip().upper()
+                tsym, exch = await equity_trade_service.get_tsym_and_exch(tick, 'NFO')
+            else:
+                tsym, exch = await equity_trade_service.get_tsym_and_exch(msg_split[2])
             cmp = float(msg_split[-1].rstrip('.'))
         if 'sl' in msg:
             m = msg.split('sl')[-1]
@@ -232,10 +149,15 @@ async def handle_angel_recommendations(message: str):
     logger.info(f"[{tsym}]:{exch} {cmp}, {tgt}, {sl}")
 
     if cmp and sl and tsym and exch and cmp != -1 and sl != -1:
-        tgt = compute_tgt(cmp, tgt)
-        sl = compute_sl(cmp, sl)
-        new_tgt = cmp + 0.5 * (tgt - cmp)
-        return TradeCandidate(tsym, exch, cmp, new_tgt, sl, 'B', TradeChannels.AngelOneAdvisory)
+        if exch != 'NFO':
+            tgt = compute_tgt(cmp, tgt)
+            sl = compute_sl(cmp, sl)
+            new_tgt = cmp + 0.5 * (tgt - cmp)
+            return TradeCandidate(tsym, exch, cmp, new_tgt, sl, 'B', TradeChannels.AngelOneAdvisory)
+        else:
+            tgt, sl = compute_long_derivative_exits(cmp, tgt, sl)
+            tc = TradeCandidate(tsym, exch, cmp, tgt, sl, 'B', TradeChannels.AngelOneAdvisory)
+            await derivative_trade_service.prepare_trade(tc)
     else:
         logger.info(f"cannot create trade candidate from message:[{message}]")
         return None
@@ -255,9 +177,9 @@ async def handle_equity99_recommendations(message: list[str]):
         if cmp_selector and cmp == -1:
             cmp = get_first_number(msg.split(' '))
             msg_split = msg.split(cmp_selector, maxsplit=1)
-            tsym, exch = await get_tsym_and_exch(msg_split[0])
+            tsym, exch = await equity_trade_service.get_tsym_and_exch(msg_split[0])
             if not tsym and prev_index >= 0:
-                tsym, exch = await get_tsym_and_exch(message[prev_index])
+                tsym, exch = await equity_trade_service.get_tsym_and_exch(message[prev_index])
         if 'coming days view' in msg and msg.isalnum():
             tgt = get_first_number(msg.split(' '), tgt)
         if 'test level' in msg and tgt == -1:
@@ -281,7 +203,7 @@ async def handle_custom_recommendations(in_msg) -> [TradeCandidate]:
     for msg in in_msg:
         msg = msg.split(',')
         if len(msg) > 1:
-            tsym, exch = await get_tsym_and_exch(msg[0].split(':')[-1].strip())
+            tsym, exch = await equity_trade_service.get_tsym_and_exch(msg[0].split(':')[-1].strip())
             cmp = float(msg[1].split(':')[-1].strip())
             if cmp and tsym and exch:
                 sl = round(0.95 * cmp, 2)
@@ -294,220 +216,26 @@ async def handle_custom_recommendations(in_msg) -> [TradeCandidate]:
     return tc_list
 
 
-async def trade_selector():
-    existing_trade_count = len(set(potential_trades_dict.values()) - {None}) + len(open_trades)
-    if existing_trade_count >= trade_config['max_open_trades']:
-        logger.info(f"Max trade limit of [{trade_config['max_open_trades']}] reached")
-    elif not candidate_queue.empty():
-        candidate: TradeCandidate = await candidate_queue.get()
-        # logger.info(candidate)
-        trade_count = db_utils.get_trade_count(TradeChannels[candidate.trade_channel])
-        max_count = trade_config[candidate.trade_channel]['max_open_trades']
-        if trade_count < max_count:
-            asyncio.create_task(execute_trade(candidate))
-        else:
-            logger.info(f"Max trade limit of [{max_count}] reached for [{candidate.trade_channel}]")
-
-@retry(Exception, tries=3, delay=5)
-async def execute_trade(tc: TradeCandidate):
-    quantity = floor(trade_config[tc.trade_channel]['fund_alloc'] / tc.cmp)
-    cash = broker_service.get_available_cash()
-    if cash < (quantity * tc.cmp):
-        logger.warning(f"Balance of {[cash]} is insufficient to trade")
-        return
-    if quantity < 1:
-        logger.warning(f"Unable to place trade for [{tc.trading_symbol}] with quantity: [{quantity}]")
-        db_utils.delete_trade_candidate(tc.trading_symbol)
-        potential_trades_dict.pop(tc.trading_symbol, None)
-        return
-    order_type = tc.open_leg
-    msg = f"Placing [BUY] Order for symbol {tc.trading_symbol}, CMP: [{tc.cmp}], target: {tc.tgt}, " \
-          f"quantity: {quantity}, stop_loss: {tc.sl}, channel: {tc.trade_channel}"
-    await bot_utils.send_alert(msg)
-
-    async with lock:
-        res = broker_service.place_order(buy_or_sell=order_type, product_type='C', exchange=tc.exchange,
-                                         tradingsymbol=tc.trading_symbol, quantity=quantity, discloseqty=0,
-                                         price_type='LMT', price=tc.cmp, retention='DAY',
-                                         remarks=f'Buy order for {tc.trading_symbol}')
-
-        if res is None:
-            raise Exception(f"Failed to place order for symbol={tc.trading_symbol}")
-        else:
-            # print(res)
-            await asyncio.sleep(0.1)
-            order_id = res['norenordno']
-            o_book = broker_service.get_order_book()
-
-            for order in o_book:
-                if order_id == order['norenordno']:
-                    if order['status'] == 'REJECTED':
-                        msg = f"Order for [{tc.trading_symbol}] rejected by broker: {order['rejreason']}"
-                        await bot_utils.send_alert(msg, logging.WARN)
-                    else:
-                        potential_trades_dict[tc.trading_symbol] = order_id
-                        contract = TradeContract.from_trade_candidate(tc, ContractStatus.PENDING, quantity,
-                                                                      order_id)
-                        await db_utils.insert_stock_record(contract)
-                        logger.info(f"Successfully placed order: {res}")
-                    return
-            logger.warning(f"Order {order_id} not found in order book")
-
-
-# TESTING METHOD
-async def gtt_testing(res, tc, order_id):
-    logger.info("Testing here")
-    res['status'] = 'COMPLETE'
-    res['tsym'] = tc.trading_symbol
-    res['trantype'] = 'B'
-    res['rejreason'] = 'Testing'
-    res['qty'] = 1
-    res['flprc'] = tc.cmp
-    res['exch'] = tc.exchange
-    res['fltm'] = datetime.datetime.now()
-    potential_trades_dict[tc.trading_symbol] = order_id
-    contract = TradeContract.from_trade_candidate(tc, ContractStatus.PENDING, 1,
-                                                  order_id)
-    await db_utils.insert_stock_record(contract)
-    order_update_listener(res)
-
-
-def handle_pending_orders(startup: bool = False):
-    pending_ids = set(potential_trades_dict.values()) - {None}
-    if len(pending_ids) > 0:
-        trade_book = broker_service.get_trade_book()
-        if trade_book:
-            for trade in trade_book:
-                if trade['norenordno'] in pending_ids:
-                    trade['status'] = 'COMPLETE'  # trade book always has completed trades
-                    pending_ids.remove(trade['norenordno'])
-                    order_update_listener(trade)
-    if len(pending_ids) > 0:
-        order_book = broker_service.get_order_book()
-        if order_book:
-            for order in order_book:
-                if order['norenordno'] in pending_ids:
-                    pending_ids.remove(order['norenordno'])
-                    order_update_listener(order)
-    if len(pending_ids) > 0 and startup:
-        db_utils.delete_stock_record(pending_ids)
-
-
-async def pending_poller():
-    logger.info("Polling for Pending orders")
-    async with lock:
-        handle_pending_orders()
-
-
-async def gtt_pending_poller():
-    pending_contracts = await db_utils.get_gtt_pending_orders()
-    logger.info(f"Polling for GTT pending orders, size=[{len(pending_contracts)}]")
-    for contract in pending_contracts:
-        await gtt_order_handling_async(contract.buy_id, contract.exchange, contract.trading_symbol, contract.qty)
-
-
-async def candidate_poller():
-    async with lock:
-        candidates_tsym = list(key for (key, value) in reversed(potential_trades_dict.items()) if key and not value)
-        logger.info(f"Polled Candidate list: {candidates_tsym}")
-        if candidates_tsym:
-            candidates = db_utils.get_trade_candidates(candidates_tsym)
-            logger.info(f"Polling for trade candidates, size=[{len(candidates)}]")
-            for candidate in candidates:
-                # logger.info(candidate)
-                await candidate_queue.put(candidate)
-
-
-def get_close_leg_type(open_leg_type: str) -> str:
-    if open_leg_type == 'B':
-        return 'S'
-    else:
-        return 'B'
-
-
-async def open_trade_poller():
-    contracts = await db_utils.get_open_orders()
-    logger.info(f"Polling for OPEN orders, size=[{len(contracts)}]")
-
-    trade_book = broker_service.get_trade_book()
-    order_book = broker_service.get_order_book()
-    trade_bk_dict, order_bk_dict = {}, {}
-    if trade_book:
-        trade_bk_dict = {(trade['tsym'], trade['trantype'], int(trade['qty'])): trade for trade in
-                         reversed(trade_book)}  # ascending order by time
-    if order_book:
-        order_bk_dict = {(order['tsym'], order['trantype'], int(order['qty'])): order for order in
-                         reversed(order_book)}
-
-    for contract in contracts:
-        is_processed = False
-        close_leg = get_close_leg_type(contract.open_leg)
-        if (contract.trading_symbol, close_leg, contract.qty) in trade_bk_dict:
-            trade = trade_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
-            contract.sell_price = trade['flprc']
-            contract.sell_id = trade['norenordno']
-            contract.sell_timestamp = trade['fltm']
-            contract.status = str(ContractStatus.CLOSE)
-            open_trades.remove(contract.trading_symbol)
-            msg = f'Closed order successfully for [{contract.trading_symbol}/{contract.buy_id}]'
-            db_utils.delete_stock_record(contract.buy_id)
-            await db_utils.insert_stock_record(contract)
-            await bot_utils.send_alert(msg)
-            is_processed = True
-        if not is_processed and (contract.trading_symbol, close_leg, contract.qty) in order_bk_dict:
-            order = order_bk_dict[(contract.trading_symbol, close_leg, contract.qty)]
-            if order['status'] in ['REJECTED', 'INVALID_STATUS_TYPE', 'CANCELED']:
-                msg = f"[CLOSE Order [{order['tsym']}] failed: [{order['status']}] [{order['rejreason']}]"
-                contract.status = str(ContractStatus.GTT_PENDING)
-                db_utils.delete_stock_record(contract.buy_id)
-                await db_utils.insert_stock_record(contract)
-                await bot_utils.send_alert(msg, logging.WARN)
-
-
-async def startup_activity():
-    db_utils.purge_closed_orders()
-    db_utils.purge_trade_candidates()
-    tc = db_utils.get_trade_candidates()
-    potential_trades_dict.update({t.trading_symbol: None for t in tc})
-    pending_orders = db_utils.get_pending_orders()
-    potential_trades_dict.update({p.trading_symbol: p.buy_id for p in pending_orders})
-    logger.info(f"Initial Candidate list: {potential_trades_dict}")
-    handle_pending_orders(True)
-
-    open_trades.update([tc.trading_symbol for tc in db_utils.get_open_orders_internal()])
-    logger.info(f"Open Trades: {open_trades}")
-
-
-@poller
 async def polling_activity():
-    await pending_poller()
-    await open_trade_poller()
-    await gtt_pending_poller()
-    await candidate_poller()
-    await trade_selector()
+    loop.create_task(equity_trade_service.polling_activity())
+    loop.create_task(derivative_trade_service.polling_activity())
 
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     initialize_db()
-    candidate_queue = SetQueue()
-    potential_trades_dict = {}  # {ticker-name: buy-order-id}
-    open_trades = set()
-    lock = asyncio.Lock()
-    thread_lock = Lock()
 
     with open(str(pathlib.Path(__file__).parent.resolve()) + '/resources/app-config.yml') as f:
         app_config = yaml.load(f, Loader=yaml.FullLoader)
         tele_config = app_config['telegram']
         trade_config = app_config['trade']
+        derivative_config = app_config['derivative']
         trade_config['max_open_trades'] = sum([val['max_open_trades'] for (_, val) in trade_config.items()])
+        derivative_config['max_open_trades'] = sum(
+            [val['max_open_trades'] for (_, val) in derivative_config['conf'].items()])
 
     # message_selectors = ['Special Situation', 'conviction' 'PSU STOCK', 'btst']
     message_selectors = ['cmp', '@', 'buy', 'exit', 'book profit', 'closing price']  # 'test level'
-
-    IST_ZONE = 'Asia/Calcutta'
-    MARKET_OPEN_TIME = datetime.time(9, 15, 00, 00, ZoneInfo(IST_ZONE))
-    MARKET_CLOSE_TIME = datetime.time(15, 30, 00, 00, ZoneInfo(IST_ZONE))
 
     client = TelegramClient('anon',
                             tele_config["api_id"],
@@ -516,11 +244,13 @@ if __name__ == '__main__':
     with client:
         loop: AbstractEventLoop = client.loop
         broker_service = ShoonyaBrokerService()
+        equity_trade_service = EquityTradeService(broker_service, loop, trade_config)
+        derivative_trade_service = DerivativeTradeService(broker_service, loop, derivative_config)
 
         loop.create_task(initialize_bot(tele_config))
         loop.create_task(broker_login())
         loop.create_task(telegram_login())
 
-        asyncio.gather(startup_activity())
+        asyncio.gather(equity_trade_service.startup_activity(), derivative_trade_service.startup_activity())
         loop.create_task(polling_activity())
         client.run_until_disconnected()
