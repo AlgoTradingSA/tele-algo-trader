@@ -71,7 +71,7 @@ class DerivativeTradeService(TradeService):
         else:
             trade_count = db_utils.get_active_trade_count(TradeChannels[candidate.trade_channel],
                                                           exch=candidate.exchange)
-            max_count = self.trade_config[candidate.trade_channel]['max_open_trades']
+            max_count = self.trade_config['conf'][candidate.trade_channel]['max_open_trades']
             if trade_count < max_count:
                 res = await self.execute_trade(candidate, candidate.open_leg)
                 if res:
@@ -85,7 +85,7 @@ class DerivativeTradeService(TradeService):
     async def execute_trade(self, tc: TradeCandidate | TradeContract, order_type: str):
         is_dry_run = self.trade_config['dry_run']
         if tc.open_leg == order_type:
-            quantity = floor(self.trade_config[tc.trade_channel]['lot_count'] * get_lot_size(tc.trading_symbol))
+            quantity = floor(self.trade_config['conf'][tc.trade_channel]['lot_count'] * get_lot_size(tc.trading_symbol))
             cash = self.broker_service.get_available_cash()
             if is_dry_run:
                 cash += self.trade_config['dry_cash']
