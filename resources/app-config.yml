@@ -16,3 +16,11 @@ trade:
   CustomChannel:
     max_open_trades: 2
     fund_alloc: 1000
+
+derivative:
+  dry_run: true
+  dry_cash: 20000
+  conf:
+    AngelOneAdvisory:
+      max_open_trades: 2
+      lot_count: 1
